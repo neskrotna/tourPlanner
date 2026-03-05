@@ -1,246 +1,264 @@
 # tourPlanner
 
-# src/cli/train.py
+# src/eval/metrics.py
 
 from __future__ import annotations
 
-import argparse
-import json
-import time
-from pathlib import Path
-from typing import Any, Dict, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
+import numpy as np
+
+
+@dataclass(frozen=True)
+class EvalMetrics:
+    accuracy: float
+    precision_pos: float
+    recall_pos: float
+    f1_pos: float
+    confusion: List[List[int]]  # [[tn, fp],[fn, tp]]
+    support_neg: int
+    support_pos: int
+
+
+def confusion_2x2(y_true: np.ndarray, y_pred: np.ndarray, pos_label: int = 1) -> Tuple[int, int, int, int]:
+    """
+    Returns (tn, fp, fn, tp) for a binary problem.
+    Assumes labels are integers (e.g. 0/1).
+    """
+    if y_true.shape != y_pred.shape:
+        raise ValueError("y_true and y_pred must have the same shape.")
+
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
+
+    neg = 0 if pos_label == 1 else 1
+    tn = int(np.sum((y_true == neg) & (y_pred == neg)))
+    fp = int(np.sum((y_true == neg) & (y_pred == pos_label)))
+    fn = int(np.sum((y_true == pos_label) & (y_pred == neg)))
+    tp = int(np.sum((y_true == pos_label) & (y_pred == pos_label)))
+    return tn, fp, fn, tp
+
+
+def safe_div(num: float, den: float) -> float:
+    return float(num / den) if den != 0 else 0.0
+
+
+def compute_binary_metrics(y_true: np.ndarray, y_pred: np.ndarray, pos_label: int = 1) -> EvalMetrics:
+    tn, fp, fn, tp = confusion_2x2(y_true, y_pred, pos_label=pos_label)
+
+    acc = safe_div(tp + tn, tp + tn + fp + fn)
+    precision = safe_div(tp, tp + fp)
+    recall = safe_div(tp, tp + fn)
+    f1 = safe_div(2 * precision * recall, precision + recall)
+
+    # support
+    support_pos = int(np.sum(y_true == pos_label))
+    support_neg = int(np.sum(y_true != pos_label))
+
+    return EvalMetrics(
+        accuracy=acc,
+        precision_pos=precision,
+        recall_pos=recall,
+        f1_pos=f1,
+        confusion=[[tn, fp], [fn, tp]],
+        support_neg=support_neg,
+        support_pos=support_pos,
+    )
+
+
+def metrics_to_dict(m: EvalMetrics) -> Dict:
+    return {
+        "accuracy": m.accuracy,
+        "precision_pos": m.precision_pos,
+        "recall_pos": m.recall_pos,
+        "f1_pos": m.f1_pos,
+        "confusion": m.confusion,
+        "support_neg": m.support_neg,
+        "support_pos": m.support_pos,
+    }
+
+--
+
+# src/eval/evaluator.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
-import yaml
 
 from src.data.packcrop_dataset import PackCropDataset
-from src.models.factory import create_model, get_num_params
+from src.eval.metrics import EvalMetrics, compute_binary_metrics
 
 
-def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # Keep it simple/stable for PoC. (Deterministic training can be slower.)
-    torch.backends.cudnn.benchmark = True
+@dataclass(frozen=True)
+class EvalResult:
+    metrics: EvalMetrics
+    y_true: List[int]
+    y_pred: List[int]
+    y_prob_pos: List[float]  # probability for class 1 (rotated)
+    paths: List[str]         # crop paths aligned with y_true/y_pred
 
 
 def get_device() -> torch.device:
     return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
-def build_transforms(image_size: int, is_train: bool) -> T.Compose:
-    # You can extend this later (color jitter, rotation augmentation etc.)
-    if is_train:
-        return T.Compose([
-            T.Resize((image_size, image_size)),
-            T.RandomHorizontalFlip(p=0.5),
-            T.ToTensor(),
-        ])
+def build_eval_transforms(image_size: int) -> T.Compose:
     return T.Compose([
         T.Resize((image_size, image_size)),
         T.ToTensor(),
     ])
 
 
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def accuracy_from_logits(logits: torch.Tensor, y: torch.Tensor) -> float:
-    preds = torch.argmax(logits, dim=1)
-    return (preds == y).float().mean().item()
-
-
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> Tuple[float, float]:
-    model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total = 0
+def run_eval(
+    cfg: Dict[str, Any],
+    checkpoint_path: Path,
+    split: str = "test",
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+) -> EvalResult:
+    """
+    Loads model from checkpoint and evaluates on the given split.
 
-    for x, y, _meta in loader:
-        x = x.to(device)
-        y = y.to(device)
+    Assumes binary classification with class 1 = "rotated".
+    """
+    device = get_device()
 
-        logits = model(x)
-        loss = criterion(logits, y)
-
-        total_loss += float(loss.item()) * y.size(0)
-        preds = torch.argmax(logits, dim=1)
-        total_correct += int((preds == y).sum().item())
-        total += int(y.size(0))
-
-    avg_loss = total_loss / max(1, total)
-    avg_acc = total_correct / max(1, total)
-    return avg_loss, avg_acc
-
-
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> Tuple[float, float]:
-    model.train()
-    total_loss = 0.0
-    total_correct = 0
-    total = 0
-
-    for x, y, _meta in loader:
-        x = x.to(device)
-        y = y.to(device)
-
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += float(loss.item()) * y.size(0)
-        preds = torch.argmax(logits, dim=1)
-        total_correct += int((preds == y).sum().item())
-        total += int(y.size(0))
-
-    avg_loss = total_loss / max(1, total)
-    avg_acc = total_correct / max(1, total)
-    return avg_loss, avg_acc
-
-
-def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, cfg: Dict[str, Any]) -> None:
-    ckpt = {
-        "epoch": epoch,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "cfg": cfg,
-    }
-    torch.save(ckpt, path)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
-    args = parser.parse_args()
-
-    cfg_path = Path(args.config)
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config not found: {cfg_path}")
-
-    cfg: Dict[str, Any] = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-
-    # ---- read cfg ----
-    seed = int(cfg["train"].get("seed", 42))
     image_size = int(cfg["train"]["image_size"])
-    batch_size = int(cfg["train"]["batch_size"])
-    epochs = int(cfg["train"]["epochs"])
-    lr = float(cfg["train"]["lr"])
-    weight_decay = float(cfg["train"].get("weight_decay", 0.0))
-    num_workers = int(cfg["train"].get("num_workers", 0))
+    bs = int(batch_size if batch_size is not None else cfg["train"]["batch_size"])
+    nw = int(num_workers if num_workers is not None else cfg["train"].get("num_workers", 0))
 
     manifest_csv = Path(cfg["dataset"]["manifest_csv"])
     classes_json = Path(cfg["dataset"]["classes_json"])
     split_json = Path(cfg["dataset"]["split_json"])
 
-    exp_root = Path(cfg["output"]["exp_root"])
-    ensure_dir(exp_root)
-
-    # ---- setup ----
-    set_seed(seed)
-    device = get_device()
-    print(f"[train] device={device}")
-
-    # ---- datasets ----
-    train_tf = build_transforms(image_size=image_size, is_train=True)
-    val_tf = build_transforms(image_size=image_size, is_train=False)
-
-    train_ds = PackCropDataset(
+    ds = PackCropDataset(
         manifest_csv=manifest_csv,
         classes_json=classes_json,
         split_json=split_json,
-        split="train",
-        transform=train_tf,
-        strict=True,
-    )
-    val_ds = PackCropDataset(
-        manifest_csv=manifest_csv,
-        classes_json=classes_json,
-        split_json=split_json,
-        split="val",
-        transform=val_tf,
+        split=split,
+        transform=build_eval_transforms(image_size),
         strict=True,
     )
 
-    print(f"[train] train_samples={len(train_ds)} counts={train_ds.class_counts()}")
-    print(f"[train] val_samples={len(val_ds)} counts={val_ds.class_counts()}")
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
+    loader = DataLoader(
+        ds,
+        batch_size=bs,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=nw,
         pin_memory=(device.type == "cuda"),
     )
 
-    # ---- model ----
+    # model
+    from src.models.factory import create_model
     model = create_model(cfg).to(device)
-    print(f"[train] model={type(model).__name__} params={get_num_params(model):,}")
 
-    # ---- loss + optimizer ----
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    # ---- training loop ----
-    best_val_acc = -1.0
-    best_path = exp_root / "best.pt"
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    state = ckpt.get("model_state", ckpt)  # tolerate raw state_dict saves
+    model.load_state_dict(state, strict=True)
+    model.eval()
 
-    history = {
+    y_true: List[int] = []
+    y_pred: List[int] = []
+    y_prob_pos: List[float] = []
+    paths: List[str] = []
+
+    softmax = nn.Softmax(dim=1)
+
+    for x, y, meta in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        logits = model(x)
+        probs = softmax(logits)
+
+        pred = torch.argmax(probs, dim=1)
+
+        # prob for positive class (id=1)
+        prob_pos = probs[:, 1]
+
+        y_true.extend([int(v) for v in y.detach().cpu().numpy().tolist()])
+        y_pred.extend([int(v) for v in pred.detach().cpu().numpy().tolist()])
+        y_prob_pos.extend([float(v) for v in prob_pos.detach().cpu().numpy().tolist()])
+
+        # meta is a dict of lists because DataLoader collates it
+        if isinstance(meta, dict) and "crop_path" in meta:
+            paths.extend([str(p) for p in meta["crop_path"]])
+        else:
+            paths.extend([""] * y.size(0))
+
+    y_true_np = np.array(y_true, dtype=int)
+    y_pred_np = np.array(y_pred, dtype=int)
+
+    metrics = compute_binary_metrics(y_true_np, y_pred_np, pos_label=1)
+
+    return EvalResult(
+        metrics=metrics,
+        y_true=y_true,
+        y_pred=y_pred,
+        y_prob_pos=y_prob_pos,
+        paths=paths,
+    )
+
+--
+
+# src/cli/eval.py
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+import yaml
+
+from src.eval.evaluator import run_eval
+from src.eval.metrics import metrics_to_dict
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint (default: <exp_root>/best.pt)")
+    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
+    args = parser.parse_args()
+
+    cfg_path = Path(args.config)
+    cfg: Dict[str, Any] = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+    exp_root = Path(cfg["output"]["exp_root"])
+    ckpt_path = Path(args.checkpoint) if args.checkpoint else (exp_root / "best.pt")
+
+    result = run_eval(cfg, checkpoint_path=ckpt_path, split=args.split)
+
+    m = result.metrics
+    print(f"[eval] split={args.split} checkpoint={ckpt_path}")
+    print(f"[eval] accuracy={m.accuracy:.4f} precision(rotated)={m.precision_pos:.4f} recall(rotated)={m.recall_pos:.4f} f1(rotated)={m.f1_pos:.4f}")
+    print(f"[eval] confusion=[[tn,fp],[fn,tp]] = {m.confusion}  support_neg={m.support_neg} support_pos={m.support_pos}")
+
+    out = {
         "config": str(cfg_path),
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "epochs": [],
+        "checkpoint": str(ckpt_path),
+        "split": args.split,
+        "metrics": metrics_to_dict(m),
     }
 
-    for epoch in range(1, epochs + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-
-        print(
-            f"[epoch {epoch:02d}/{epochs}] "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
-        )
-
-        history["epochs"].append({
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "val_loss": val_loss,
-            "val_acc": val_acc,
-        })
-
-        # Save last checkpoint each epoch (simple + reliable)
-        save_checkpoint(exp_root / "last.pt", model, optimizer, epoch, cfg)
-
-        # Save best checkpoint
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            save_checkpoint(best_path, model, optimizer, epoch, cfg)
-            print(f"[train] new best val_acc={best_val_acc:.4f} -> {best_path}")
-
-    history["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    history["best_val_acc"] = best_val_acc
-
-    (exp_root / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    print(f"[train] done. best_val_acc={best_val_acc:.4f} history={exp_root/'history.json'}")
+    out_path = exp_root / f"eval_{args.split}.json"
+    out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(f"[eval] wrote {out_path}")
 
 
 if __name__ == "__main__":
