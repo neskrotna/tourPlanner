@@ -167,4 +167,113 @@ class Trainer:
             path
         )
 
+--
+
+# src/models/factory.py
+
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
+import torch.nn as nn
+from torchvision.models import (
+    resnet18,
+    ResNet18_Weights,
+    convnext_small,
+    ConvNeXt_Small_Weights,
+    efficientnet_b0,
+    EfficientNet_B0_Weights,
+)
+
+
+def _get_model_cfg(cfg: Dict[str, Any]) -> Tuple[str, bool, int]:
+    if "model" not in cfg:
+        raise ValueError("Config is missing the 'model' section.")
+
+    mcfg = cfg["model"]
+    name = mcfg.get("name")
+    if not name:
+        raise ValueError("Config is missing model.name (e.g. 'resnet18').")
+
+    pretrained = bool(mcfg.get("pretrained", False))
+    num_classes = int(mcfg.get("num_classes", 2))
+
+    if num_classes < 2:
+        raise ValueError(f"num_classes must be >= 2, got {num_classes}.")
+
+    return str(name).lower(), pretrained, num_classes
+
+
+def create_model(cfg: Dict[str, Any]) -> nn.Module:
+    """
+    Torchvision-only model factory (no Hugging Face).
+
+    Supported model names:
+      - "resnet18"
+      - "convnext_small"   (also accepts "convnext-small")
+      - "efficientnet_b0"  (also accepts "efficientnet-b0")
+
+    Expected cfg:
+      cfg["model"]["name"]
+      cfg["model"]["pretrained"]  (bool)
+      cfg["model"]["num_classes"] (int)
+    """
+    name, pretrained, num_classes = _get_model_cfg(cfg)
+
+    if name == "resnet18":
+        weights = ResNet18_Weights.DEFAULT if pretrained else None
+        model = resnet18(weights=weights)
+        in_features = model.fc.in_features
+        model.fc = nn.Linear(in_features, num_classes)
+        return model
+
+    if name in {"convnext_small", "convnext-small"}:
+        weights = ConvNeXt_Small_Weights.DEFAULT if pretrained else None
+        model = convnext_small(weights=weights)
+
+        # Torchvision ConvNeXt classifier is: Sequential(LayerNorm2d, Flatten, Linear)
+        # Replace the last Linear.
+        if not isinstance(model.classifier, nn.Sequential) or len(model.classifier) < 1:
+            raise RuntimeError("Unexpected ConvNeXt classifier structure.")
+
+        last = model.classifier[-1]
+        if not isinstance(last, nn.Linear):
+            raise RuntimeError("Unexpected ConvNeXt last classifier layer (expected nn.Linear).")
+
+        in_features = last.in_features
+        model.classifier[-1] = nn.Linear(in_features, num_classes)
+        return model
+
+    if name in {"efficientnet_b0", "efficientnet-b0"}:
+        weights = EfficientNet_B0_Weights.DEFAULT if pretrained else None
+        model = efficientnet_b0(weights=weights)
+
+        # Torchvision EfficientNet classifier is: Sequential(Dropout, Linear)
+        if not isinstance(model.classifier, nn.Sequential) or len(model.classifier) < 1:
+            raise RuntimeError("Unexpected EfficientNet classifier structure.")
+
+        last = model.classifier[-1]
+        if not isinstance(last, nn.Linear):
+            raise RuntimeError("Unexpected EfficientNet last classifier layer (expected nn.Linear).")
+
+        in_features = last.in_features
+        model.classifier[-1] = nn.Linear(in_features, num_classes)
+        return model
+
+    raise ValueError(
+        f"Unsupported model name '{name}'. Supported: "
+        "['resnet18', 'convnext_small', 'efficientnet_b0']."
+    )
+
+
+def get_num_params(model: nn.Module, trainable_only: bool = False) -> int:
+    """
+    Count parameters.
+      - trainable_only=False: counts all parameters
+      - trainable_only=True: counts only parameters with requires_grad=True
+    """
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
+
 xxx
