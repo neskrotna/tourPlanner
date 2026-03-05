@@ -1,279 +1,249 @@
 # tourPlanner
 
-import os
-from pathlib import Path
-
-import torch
-from torch.utils.data import DataLoader
-import torchvision.transforms as T
-
-from src.data.packcrop_dataset import PackCropDataset
-from src.models.factory import create_model
-from src.utils.device import get_device
-from src.utils.seed import set_seed
-
-
-class Trainer:
-    def __init__(self, cfg):
-
-        self.cfg = cfg
-
-        set_seed(cfg["train"]["seed"])
-        self.device = get_device()
-
-        self.train_ds = PackCropDataset(
-            Path(cfg["dataset"]["manifest_csv"]),
-            Path(cfg["dataset"]["classes_json"]),
-            Path(cfg["dataset"]["split_json"]),
-            split="train",
-            transform=self._build_transforms()
-        )
-
-        self.val_ds = PackCropDataset(
-            Path(cfg["dataset"]["manifest_csv"]),
-            Path(cfg["dataset"]["classes_json"]),
-            Path(cfg["dataset"]["split_json"]),
-            split="val",
-            transform=self._build_transforms()
-        )
-
-        self.train_loader = DataLoader(
-            self.train_ds,
-            batch_size=cfg["train"]["batch_size"],
-            shuffle=True,
-            num_workers=cfg["train"]["num_workers"]
-        )
-
-        self.val_loader = DataLoader(
-            self.val_ds,
-            batch_size=cfg["train"]["batch_size"],
-            shuffle=False,
-            num_workers=cfg["train"]["num_workers"]
-        )
-
-        self.model = create_model(cfg).to(self.device)
-
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=cfg["train"]["lr"],
-            weight_decay=cfg["train"]["weight_decay"]
-        )
-
-        self.criterion = torch.nn.CrossEntropyLoss()
-
-        self.exp_dir = Path(cfg["output"]["exp_root"])
-        self.exp_dir.mkdir(parents=True, exist_ok=True)
-
-    def _build_transforms(self):
-
-        size = self.cfg["train"]["image_size"]
-
-        return T.Compose([
-            T.ToPILImage(),
-            T.Resize((size, size)),
-            T.ToTensor()
-        ])
-
-    def train(self):
-
-        epochs = self.cfg["train"]["epochs"]
-
-        for epoch in range(epochs):
-
-            train_loss, train_acc = self._train_epoch()
-            val_loss, val_acc = self._validate_epoch()
-
-            print(
-                f"Epoch {epoch+1}/{epochs} "
-                f"train_loss={train_loss:.4f} "
-                f"train_acc={train_acc:.4f} "
-                f"val_loss={val_loss:.4f} "
-                f"val_acc={val_acc:.4f}"
-            )
-
-            self._save_checkpoint(epoch)
-
-    def _train_epoch(self):
-
-        self.model.train()
-
-        total_loss = 0
-        correct = 0
-        total = 0
-
-        for x, y, _ in self.train_loader:
-
-            x = x.to(self.device)
-            y = y.to(self.device)
-
-            self.optimizer.zero_grad()
-
-            logits = self.model(x)
-            loss = self.criterion(logits, y)
-
-            loss.backward()
-            self.optimizer.step()
-
-            total_loss += loss.item() * x.size(0)
-
-            preds = torch.argmax(logits, dim=1)
-            correct += (preds == y).sum().item()
-            total += y.size(0)
-
-        avg_loss = total_loss / total
-        acc = correct / total
-
-        return avg_loss, acc
-
-    def _validate_epoch(self):
-
-        self.model.eval()
-
-        total_loss = 0
-        correct = 0
-        total = 0
-
-        with torch.no_grad():
-
-            for x, y, _ in self.val_loader:
-
-                x = x.to(self.device)
-                y = y.to(self.device)
-
-                logits = self.model(x)
-                loss = self.criterion(logits, y)
-
-                total_loss += loss.item() * x.size(0)
-
-                preds = torch.argmax(logits, dim=1)
-                correct += (preds == y).sum().item()
-                total += y.size(0)
-
-        avg_loss = total_loss / total
-        acc = correct / total
-
-        return avg_loss, acc
-
-    def _save_checkpoint(self, epoch):
-
-        path = self.exp_dir / f"model_epoch_{epoch+1}.pt"
-
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state": self.model.state_dict(),
-                "optimizer_state": self.optimizer.state_dict(),
-            },
-            path
-        )
-
---
-
-# src/models/factory.py
+# src/cli/train.py
 
 from __future__ import annotations
 
+import argparse
+import json
+import time
+from pathlib import Path
 from typing import Any, Dict, Tuple
 
+import torch
 import torch.nn as nn
-from torchvision.models import (
-    resnet18,
-    ResNet18_Weights,
-    convnext_small,
-    ConvNeXt_Small_Weights,
-    efficientnet_b0,
-    EfficientNet_B0_Weights,
-)
+from torch.utils.data import DataLoader
+import torchvision.transforms as T
+import yaml
+
+from src.data.packcrop_dataset import PackCropDataset
+from src.models.factory import create_model, get_num_params
 
 
-def _get_model_cfg(cfg: Dict[str, Any]) -> Tuple[str, bool, int]:
-    if "model" not in cfg:
-        raise ValueError("Config is missing the 'model' section.")
-
-    mcfg = cfg["model"]
-    name = mcfg.get("name")
-    if not name:
-        raise ValueError("Config is missing model.name (e.g. 'resnet18').")
-
-    pretrained = bool(mcfg.get("pretrained", False))
-    num_classes = int(mcfg.get("num_classes", 2))
-
-    if num_classes < 2:
-        raise ValueError(f"num_classes must be >= 2, got {num_classes}.")
-
-    return str(name).lower(), pretrained, num_classes
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Keep it simple/stable for PoC. (Deterministic training can be slower.)
+    torch.backends.cudnn.benchmark = True
 
 
-def create_model(cfg: Dict[str, Any]) -> nn.Module:
-    """
-    Torchvision-only model factory (no Hugging Face).
+def get_device() -> torch.device:
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    Supported model names:
-      - "resnet18"
-      - "convnext_small"   (also accepts "convnext-small")
-      - "efficientnet_b0"  (also accepts "efficientnet-b0")
 
-    Expected cfg:
-      cfg["model"]["name"]
-      cfg["model"]["pretrained"]  (bool)
-      cfg["model"]["num_classes"] (int)
-    """
-    name, pretrained, num_classes = _get_model_cfg(cfg)
+def build_transforms(image_size: int, is_train: bool) -> T.Compose:
+    # You can extend this later (color jitter, rotation augmentation etc.)
+    if is_train:
+        return T.Compose([
+            T.Resize((image_size, image_size)),
+            T.RandomHorizontalFlip(p=0.5),
+            T.ToTensor(),
+        ])
+    return T.Compose([
+        T.Resize((image_size, image_size)),
+        T.ToTensor(),
+    ])
 
-    if name == "resnet18":
-        weights = ResNet18_Weights.DEFAULT if pretrained else None
-        model = resnet18(weights=weights)
-        in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, num_classes)
-        return model
 
-    if name in {"convnext_small", "convnext-small"}:
-        weights = ConvNeXt_Small_Weights.DEFAULT if pretrained else None
-        model = convnext_small(weights=weights)
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
-        # Torchvision ConvNeXt classifier is: Sequential(LayerNorm2d, Flatten, Linear)
-        # Replace the last Linear.
-        if not isinstance(model.classifier, nn.Sequential) or len(model.classifier) < 1:
-            raise RuntimeError("Unexpected ConvNeXt classifier structure.")
 
-        last = model.classifier[-1]
-        if not isinstance(last, nn.Linear):
-            raise RuntimeError("Unexpected ConvNeXt last classifier layer (expected nn.Linear).")
+def accuracy_from_logits(logits: torch.Tensor, y: torch.Tensor) -> float:
+    preds = torch.argmax(logits, dim=1)
+    return (preds == y).float().mean().item()
 
-        in_features = last.in_features
-        model.classifier[-1] = nn.Linear(in_features, num_classes)
-        return model
 
-    if name in {"efficientnet_b0", "efficientnet-b0"}:
-        weights = EfficientNet_B0_Weights.DEFAULT if pretrained else None
-        model = efficientnet_b0(weights=weights)
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> Tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total = 0
 
-        # Torchvision EfficientNet classifier is: Sequential(Dropout, Linear)
-        if not isinstance(model.classifier, nn.Sequential) or len(model.classifier) < 1:
-            raise RuntimeError("Unexpected EfficientNet classifier structure.")
+    for x, y, _meta in loader:
+        x = x.to(device)
+        y = y.to(device)
 
-        last = model.classifier[-1]
-        if not isinstance(last, nn.Linear):
-            raise RuntimeError("Unexpected EfficientNet last classifier layer (expected nn.Linear).")
+        logits = model(x)
+        loss = criterion(logits, y)
 
-        in_features = last.in_features
-        model.classifier[-1] = nn.Linear(in_features, num_classes)
-        return model
+        total_loss += float(loss.item()) * y.size(0)
+        preds = torch.argmax(logits, dim=1)
+        total_correct += int((preds == y).sum().item())
+        total += int(y.size(0))
 
-    raise ValueError(
-        f"Unsupported model name '{name}'. Supported: "
-        "['resnet18', 'convnext_small', 'efficientnet_b0']."
+    avg_loss = total_loss / max(1, total)
+    avg_acc = total_correct / max(1, total)
+    return avg_loss, avg_acc
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> Tuple[float, float]:
+    model.train()
+    total_loss = 0.0
+    total_correct = 0
+    total = 0
+
+    for x, y, _meta in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += float(loss.item()) * y.size(0)
+        preds = torch.argmax(logits, dim=1)
+        total_correct += int((preds == y).sum().item())
+        total += int(y.size(0))
+
+    avg_loss = total_loss / max(1, total)
+    avg_acc = total_correct / max(1, total)
+    return avg_loss, avg_acc
+
+
+def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, cfg: Dict[str, Any]) -> None:
+    ckpt = {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "cfg": cfg,
+    }
+    torch.save(ckpt, path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
+    args = parser.parse_args()
+
+    cfg_path = Path(args.config)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config not found: {cfg_path}")
+
+    cfg: Dict[str, Any] = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+    # ---- read cfg ----
+    seed = int(cfg["train"].get("seed", 42))
+    image_size = int(cfg["train"]["image_size"])
+    batch_size = int(cfg["train"]["batch_size"])
+    epochs = int(cfg["train"]["epochs"])
+    lr = float(cfg["train"]["lr"])
+    weight_decay = float(cfg["train"].get("weight_decay", 0.0))
+    num_workers = int(cfg["train"].get("num_workers", 0))
+
+    manifest_csv = Path(cfg["dataset"]["manifest_csv"])
+    classes_json = Path(cfg["dataset"]["classes_json"])
+    split_json = Path(cfg["dataset"]["split_json"])
+
+    exp_root = Path(cfg["output"]["exp_root"])
+    ensure_dir(exp_root)
+
+    # ---- setup ----
+    set_seed(seed)
+    device = get_device()
+    print(f"[train] device={device}")
+
+    # ---- datasets ----
+    train_tf = build_transforms(image_size=image_size, is_train=True)
+    val_tf = build_transforms(image_size=image_size, is_train=False)
+
+    train_ds = PackCropDataset(
+        manifest_csv=manifest_csv,
+        classes_json=classes_json,
+        split_json=split_json,
+        split="train",
+        transform=train_tf,
+        strict=True,
+    )
+    val_ds = PackCropDataset(
+        manifest_csv=manifest_csv,
+        classes_json=classes_json,
+        split_json=split_json,
+        split="val",
+        transform=val_tf,
+        strict=True,
     )
 
+    print(f"[train] train_samples={len(train_ds)} counts={train_ds.class_counts()}")
+    print(f"[train] val_samples={len(val_ds)} counts={val_ds.class_counts()}")
 
-def get_num_params(model: nn.Module, trainable_only: bool = False) -> int:
-    """
-    Count parameters.
-      - trainable_only=False: counts all parameters
-      - trainable_only=True: counts only parameters with requires_grad=True
-    """
-    if trainable_only:
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return sum(p.numel() for p in model.parameters())
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    # ---- model ----
+    model = create_model(cfg).to(device)
+    print(f"[train] model={type(model).__name__} params={get_num_params(model):,}")
+
+    # ---- loss + optimizer ----
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # ---- training loop ----
+    best_val_acc = -1.0
+    best_path = exp_root / "best.pt"
+
+    history = {
+        "config": str(cfg_path),
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "epochs": [],
+    }
+
+    for epoch in range(1, epochs + 1):
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+
+        print(
+            f"[epoch {epoch:02d}/{epochs}] "
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+        )
+
+        history["epochs"].append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+        })
+
+        # Save last checkpoint each epoch (simple + reliable)
+        save_checkpoint(exp_root / "last.pt", model, optimizer, epoch, cfg)
+
+        # Save best checkpoint
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            save_checkpoint(best_path, model, optimizer, epoch, cfg)
+            print(f"[train] new best val_acc={best_val_acc:.4f} -> {best_path}")
+
+    history["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    history["best_val_acc"] = best_val_acc
+
+    (exp_root / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    print(f"[train] done. best_val_acc={best_val_acc:.4f} history={exp_root/'history.json'}")
+
+
+if __name__ == "__main__":
+    main()
 
 xxx
